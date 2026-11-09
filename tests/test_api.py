@@ -224,9 +224,11 @@ def test_openapi_contains_every_spec_path(client):
 
 def test_member_task_isolation_and_approval(client):
     project, agent, _ = seed(client)
-    first = client.post('/v1/members', headers=headers(), json={'name': 'First'}).json()
-    second = client.post('/v1/members', headers=headers(), json={'name': 'Second'}).json()
+    first = client.post('/v1/members', headers=headers(), json={'name': 'First', 'api_key': 'first-member-key-001'}).json()
+    second = client.post('/v1/members', headers=headers(), json={'name': 'Second', 'api_key': 'second-member-key-002'}).json()
     one, two = headers(first['api_key']), headers(second['api_key'])
+    assert client.get('/v1/me', headers=one).json()['allowed_tabs'] == ['tasks', 'projects']
+    assert 'members' in client.get('/v1/me', headers=headers()).json()['allowed_tabs']
     task = client.post('/v1/tasks', headers=one, json={'project_id': project['id'], 'title': 'Private submission'}).json()
     path = '/v1/tasks/' + task['id']
     assert not task['approved']
@@ -259,7 +261,7 @@ def test_task_close_delete_permissions(client):
 
 def test_member_status_changes_and_creator_filter(client):
     project, _, _ = seed(client)
-    member = client.post('/v1/members', headers=headers(), json={'name': 'Creator'}).json()
+    member = client.post('/v1/members', headers=headers(), json={'name': 'Creator', 'api_key': 'creator-member-key-003'}).json()
     own = headers(member['api_key'])
     task = client.post('/v1/tasks', headers=own, json={'project_id': project['id'], 'title': 'Own task'}).json()
     other = client.post('/v1/tasks', headers=headers('test-key'), json={'project_id': project['id'], 'title': 'Other task'}).json()
@@ -295,7 +297,7 @@ def test_member_can_edit_and_delete_own_task(client):
     assert client.post(path+'/claim', headers=headers(), json={'agent_id':agent['id']}).status_code == 409
     assert client.patch(path, headers=owner, json={'title':' '}).status_code == 422
     assert client.patch(path, headers=owner, json={'actor_agent_id':agent['id']}).status_code == 403
-    other = client.post('/v1/members', headers=headers(), json={'name':'Other'}).json()
+    other = client.post('/v1/members', headers=headers(), json={'name':'Other', 'api_key': 'other-member-key-004'}).json()
     assert client.patch(path, headers=headers(other['api_key']), json={'title':'Hijack'}).status_code == 404
     assert client.delete(path, headers=headers(other['api_key'])).status_code == 404
     assert client.delete(path, headers=owner).json()['deleted'] is True

@@ -6,7 +6,7 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 VENV_DIR="${PROJECT_DIR}/.venv"
 UNIT_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}/systemd/user"
 UNIT_FILE="${UNIT_DIR}/agent-memory-server.service"
-MEMORY_BIND_HOST="${MEMORY_BIND_HOST:-127.0.0.1}"
+MEMORY_BIND_HOST="${MEMORY_BIND_HOST:-0.0.0.0}"
 MEMORY_SERVER_API_KEY="${MEMORY_API_KEY:-dev-key}"
 
 if [[ ! "${MEMORY_BIND_HOST}" =~ ^(127\.0\.0\.1|0\.0\.0\.0)$ ]]; then

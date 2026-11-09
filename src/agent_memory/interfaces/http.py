@@ -1,5 +1,4 @@
 import os
-import secrets
 import hashlib
 import json
 import base64
@@ -164,7 +163,13 @@ def build_router(store, project_service, agent_service, memory_service):
 
     @router.get("/me")
     def me(request: Request):
-        return {"role": request.state.api_key_role, "id": request.state.creator_id}
+        role = request.state.api_key_role
+        allowed_tabs = (
+            ["overview", "tasks", "projects", "memories", "agents", "sessions", "instructions", "audit", "members"]
+            if role == "dev"
+            else ["tasks", "projects"]
+        )
+        return {"role": role, "id": request.state.creator_id, "allowed_tabs": allowed_tabs}
 
     @router.get("/members")
     def members():
@@ -174,9 +179,9 @@ def build_router(store, project_service, agent_service, memory_service):
     @router.post("/members", status_code=201)
     def add_member(body: dict[str, Any]):
         name = str(body.get("name", "")).strip()
-        key = body.get("api_key") or secrets.token_urlsafe(32)
+        key = body.get("api_key")
         if not name or not isinstance(key, str) or len(key) < 16:
-            raise HTTPException(422, "Name and a key of at least 16 characters required")
+            raise HTTPException(422, "Name and an API key of at least 16 characters are required")
         if key in {os.getenv("MEMORY_API_KEY", "dev-key"), os.getenv("MEMORY_TEST_API_KEY", "test-key")}:
             raise HTTPException(409, "Key already in use")
         member_id = str(uuid4())
