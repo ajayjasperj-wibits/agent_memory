@@ -363,6 +363,7 @@ class SQLiteStore:
         task = self.task_get(task_id)
         if not task:
             return False
+        self.db.execute("DELETE FROM records WHERE collection='task_instructions' AND id=?", (str(task_id),))
         self.db.execute("DELETE FROM tasks WHERE id=?", (str(task_id),))
         self.db.commit()
         self.record_create(

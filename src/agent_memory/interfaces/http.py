@@ -4,6 +4,9 @@ import json
 import base64
 import sqlite3
 import re
+import shlex
+import subprocess
+import threading
 from pathlib import Path
 from fastapi.responses import StreamingResponse, FileResponse
 from datetime import datetime, timezone
@@ -69,9 +72,33 @@ class TaskPatch(BaseModel):
     note: str | None = Field(default=None, max_length=4000)
 
 
+class TaskInstructionsIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    instruction_ids: list[UUID] = Field(max_length=100)
+
+
+class InstructionPatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    title: str | None = Field(default=None, min_length=1, max_length=500)
+    content: str | None = Field(default=None, min_length=1)
+    priority: int | None = Field(default=None, ge=0, le=100)
+    status: Literal["draft", "approved", "revoked"] | None = None
+    tags: list[str] | None = None
+    expires_at: Any | None = None
+
+
 class TaskEventIn(BaseModel):
     agent_id: UUID | None = None
     note: str = Field(default="", max_length=4000)
+
+
+class TaskSessionIn(BaseModel):
+    title: str | None = Field(default=None, max_length=240)
+    agent_id: UUID | None = None
+
+
+class AgentRunIn(BaseModel):
+    session_id: UUID | None = None
 
 
 class Page(BaseModel):
@@ -140,6 +167,10 @@ def build_router(store, project_service, agent_service, memory_service):
     def task_output(task):
         result = _out(task)
         result["attachments"] = store.task_attachments(task.id)
+        mapping = store.record_get("task_instructions", str(task.id)) or {}
+        result["instructions"] = [instruction for instruction_id in mapping.get("instruction_ids", [])
+                                  if (instruction := store.record_get("instructions", instruction_id))]
+        result["instruction_ids"] = [item["id"] for item in result["instructions"]]
         return result
 
     def get_task(task_id):
@@ -159,7 +190,7 @@ def build_router(store, project_service, agent_service, memory_service):
 
     @router.get("/meta")
     def meta():
-        return {"version": "0.1.0", "features": ["projects", "agents", "memories", "tasks", "task_attachments", "keyword_search"], "limits": {"max_batch": 100}}
+        return {"version": "0.1.0", "features": ["projects", "agents", "memories", "tasks", "task_attachments", "task_console", "keyword_search"], "limits": {"max_batch": 100}}
 
     @router.get("/me")
     def me(request: Request):
@@ -191,6 +222,15 @@ def build_router(store, project_service, agent_service, memory_service):
         except sqlite3.IntegrityError:
             raise HTTPException(409, "Key already in use")
         return {"id": member_id, "name": name, "api_key": key}
+
+    @router.delete("/members/{member_id}", dependencies=[Depends(admin_key)])
+    def delete_member(member_id: UUID):
+        # Keep task authorship/history; removing the key revokes further access.
+        with store._lock, store.db:
+            deleted = store.db.execute("DELETE FROM members WHERE id=?", (str(member_id),))
+            if deleted.rowcount == 0:
+                raise HTTPException(404, "Member not found")
+        return {"deleted": True, "id": str(member_id)}
 
     # Tasks coordinate user and agent work independently of memory records.
     @router.post("/tasks", status_code=201)
@@ -331,7 +371,177 @@ def build_router(store, project_service, agent_service, memory_service):
         events = store.task_events(task_id, limit=limit + 1, offset=offset)
         return page_cursor(events, limit, offset)
 
-    @router.post("/tasks/{task_id}/attachments", status_code=201)
+    @router.get("/tasks/{task_id}/sessions", response_model=Page)
+    def list_task_sessions(task_id: UUID, limit: int = Query(20, ge=1, le=100), cursor: str | None = None):
+        get_task(task_id)
+        return page("sessions", {"task_id": str(task_id)}, limit, cursor)
+
+    @router.post("/tasks/{task_id}/sessions", status_code=201)
+    def create_task_session(task_id: UUID, body: TaskSessionIn):
+        task = get_task(task_id)
+        agent_id = body.agent_id or task.agent_id
+        if agent_id:
+            validate_task_agent(agent_id, task.project_id)
+        return store.record_create("sessions", {
+            "project_id": str(task.project_id),
+            "agent_id": str(agent_id) if agent_id else None,
+            "task_id": str(task.id),
+            "task": task.title,
+            "title": body.title or f"{task.title} console",
+            "status": "active",
+            "metadata": {"task_id": str(task.id), "source": "task-console"},
+        })
+
+    def run_configured_agent(task, session):
+        command = os.getenv("AGENT_CLI_COMMAND", "").strip()
+        if not command:
+            return False
+        try:
+            argv = shlex.split(command)
+        except ValueError as exc:
+            raise HTTPException(500, f"Invalid AGENT_CLI_COMMAND: {exc}") from exc
+        if not argv:
+            return False
+        workspace = os.getenv("AGENT_CLI_WORKSPACE", os.getcwd())
+        if not Path(workspace).is_dir():
+            raise HTTPException(500, "AGENT_CLI_WORKSPACE is not a directory")
+        session_id = str(session["id"])
+
+        def worker():
+            env = os.environ.copy()
+            env.update({
+                "AGENT_MEMORY_TASK_ID": str(task.id),
+                "AGENT_MEMORY_SESSION_ID": session_id,
+                "AGENT_MEMORY_PROJECT_ID": str(task.project_id),
+            })
+            process = None
+            try:
+                prior_events = store.record_list("events", {"session_id": session_id}, limit=50)
+                transcript = "\n".join(
+                    f"{event.get('role', 'event')}: {event.get('content', '')}"
+                    for event in reversed(prior_events)
+                )
+                prompt = (
+                    "Work on the following task in the configured workspace. "
+                    "Use the task requirements and session discussion as context.\n\n"
+                    f"Task title: {task.title}\nTask description:\n{task.description or '(none)'}\n\n"
+                    f"Session discussion:\n{transcript or '(none)'}\n"
+                )
+                store.record_create("events", {
+                    "session_id": session_id,
+                    "role": "system",
+                    "kind": "checkpoint",
+                    "content": f"CLI agent started: {argv[0]}",
+                    "tool_name": argv[0],
+                })
+                process = subprocess.Popen(
+                    argv,
+                    cwd=workspace,
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    stdin=subprocess.PIPE,
+                    text=True,
+                    bufsize=1,
+                )
+                if process.stdin:
+                    process.stdin.write(prompt)
+                    process.stdin.close()
+                for line in process.stdout or ():
+                    content = line.rstrip()
+                    if content:
+                        store.record_create("events", {
+                            "session_id": session_id,
+                            "role": "tool",
+                            "kind": "tool_result",
+                            "content": content,
+                            "tool_name": argv[0],
+                        })
+                return_code = process.wait()
+                final_status = "completed" if return_code == 0 else "failed"
+                store.record_create("events", {
+                    "session_id": session_id,
+                    "role": "system",
+                    "kind": "checkpoint" if return_code == 0 else "error",
+                    "content": f"CLI agent exited with code {return_code}",
+                })
+                store.record_update("sessions", session_id, {
+                    "status": final_status,
+                    "ended_at": datetime.now(timezone.utc).isoformat(),
+                    "exit_code": return_code,
+                })
+                task.status = "done" if return_code == 0 else "reopened"
+                task.completed_at = datetime.now(timezone.utc) if return_code == 0 else None
+                task.updated_at = datetime.now(timezone.utc)
+                store.task_update(task, actor_agent_id=task.agent_id, action="agent_finished",
+                                  from_status="working",
+                                  note=f"CLI agent exited with code {return_code}")
+            except Exception as exc:
+                store.record_create("events", {
+                    "session_id": session_id,
+                    "role": "system",
+                    "kind": "error",
+                    "content": f"CLI agent failed to start or stream output: {exc}",
+                })
+                store.record_update("sessions", session_id, {
+                    "status": "failed",
+                    "ended_at": datetime.now(timezone.utc).isoformat(),
+                })
+
+        threading.Thread(target=worker, name=f"agent-session-{session_id}", daemon=True).start()
+        return True
+
+    @router.post("/tasks/{task_id}/run", status_code=202)
+    def run_task_agent(task_id: UUID, body: AgentRunIn):
+        task = get_task(task_id)
+        if not task.approved:
+            raise HTTPException(409, "Task requires approval before an agent can run")
+        session = record("sessions", body.session_id) if body.session_id else None
+        if session and session.get("task_id") != str(task.id):
+            raise HTTPException(422, "Session is not linked to this task")
+        if not session:
+            session = create_task_session(task_id, TaskSessionIn())
+        if session.get("status") != "active":
+            if session.get("status") not in {"completed", "failed", "cancelled"}:
+                raise HTTPException(409, "Session is not active")
+            session = store.record_update("sessions", session["id"], {
+                "status": "active",
+                "ended_at": None,
+                "exit_code": None,
+            })
+        if not os.getenv("AGENT_CLI_COMMAND", "").strip():
+            raise HTTPException(409, "AGENT_CLI_COMMAND is not configured")
+        previous_status = task.status
+        task.status = "working"
+        task.updated_at = datetime.now(timezone.utc)
+        store.task_update(task, actor_agent_id=task.agent_id, action="agent_started",
+                          from_status=previous_status,
+                          note=f"CLI agent started in session {session['id']}")
+        run_configured_agent(task, session)
+        return {"task_id": str(task.id), "session_id": session["id"], "status": "started"}
+
+    @router.put("/tasks/{task_id}/instructions", dependencies=[Depends(admin_key)])
+    def map_task_instructions(task_id: UUID, body: TaskInstructionsIn):
+        with store._lock:
+            task = get_task(task_id)
+            ids = list(dict.fromkeys(str(value) for value in body.instruction_ids))
+            for instruction_id in ids:
+                instruction = store.record_get("instructions", instruction_id)
+                if not instruction:
+                    raise HTTPException(404, "Instruction not found")
+                if instruction.get("status") != "approved":
+                    raise HTTPException(422, "Only approved instructions can be mapped to tasks")
+            current = store.record_get("task_instructions", str(task_id))
+            if not current or current.get("instruction_ids") != ids:
+                data = {"instruction_ids": ids, "project_id": str(task.project_id)}
+                if current:
+                    store.record_update("task_instructions", str(task_id), data)
+                else:
+                    store.record_create("task_instructions", {"id": str(task_id), **data})
+                store.task_event(task_id, "instructions_mapped", note=f"Mapped {len(ids)} instruction(s)")
+            return task_output(task)
+
+    @router.post("/tasks/{task_id}/attachments", status_code=201, dependencies=[Depends(admin_key)])
     async def add_task_attachments(task_id: UUID, files: list[UploadFile] = File(...),
                                    source_paths: list[str] | None = Form(default=None)):
         get_task(task_id)
@@ -354,22 +564,36 @@ def build_router(store, project_service, agent_service, memory_service):
                 raise HTTPException(413, "Combined attachments must be 100 MB or smaller")
             payloads.append((index, upload, payload))
         created = []
-        for index, upload, payload in payloads:
-            original_name = Path(upload.filename or "attachment").name
-            safe_name = re.sub(r"[^A-Za-z0-9._ -]", "_", original_name).strip(" .")[:160]
-            safe_name = safe_name or "attachment"
-            attachment_id = str(uuid4())
-            target = (directory / f"{attachment_id}-{safe_name}").resolve()
-            if not target.is_relative_to(base):
-                raise HTTPException(400, "Invalid attachment filename")
-            target.write_bytes(payload)
-            source_path = source_paths[index] if index < len(source_paths) else original_name
-            created.append(store.task_add_attachment(task_id, {
-                "id": attachment_id, "original_name": original_name,
-                "source_path": source_path, "path": str(target),
-                "mime_type": upload.content_type, "size_bytes": len(payload),
-            }))
-        return {"items": created}
+        skipped = []
+        # Serialize comparison and insertion with other attachment operations.
+        with store._lock:
+            known_hashes = set()
+            for attachment in store.task_attachments(task_id):
+                existing = Path(attachment["path"]).resolve()
+                if existing.is_relative_to(base) and existing.is_file():
+                    with existing.open("rb") as stream:
+                        known_hashes.add(hashlib.file_digest(stream, "sha256").hexdigest())
+            for index, upload, payload in payloads:
+                original_name = Path(upload.filename or "attachment").name
+                digest = hashlib.sha256(payload).hexdigest()
+                if digest in known_hashes:
+                    skipped.append(original_name)
+                    continue
+                safe_name = re.sub(r"[^A-Za-z0-9._ -]", "_", original_name).strip(" .")[:160]
+                safe_name = safe_name or "attachment"
+                attachment_id = str(uuid4())
+                target = (directory / f"{attachment_id}-{safe_name}").resolve()
+                if not target.is_relative_to(base):
+                    raise HTTPException(400, "Invalid attachment filename")
+                target.write_bytes(payload)
+                source_path = source_paths[index] if index < len(source_paths) else original_name
+                created.append(store.task_add_attachment(task_id, {
+                    "id": attachment_id, "original_name": original_name,
+                    "source_path": source_path, "path": str(target),
+                    "mime_type": upload.content_type, "size_bytes": len(payload),
+                }))
+                known_hashes.add(digest)
+        return {"items": created, "skipped_duplicates": skipped}
 
     @router.get("/tasks/{task_id}/attachments/{attachment_id}/download")
     def download_task_attachment(task_id: UUID, attachment_id: UUID):
@@ -550,10 +774,18 @@ def build_router(store, project_service, agent_service, memory_service):
         if not item: raise HTTPException(404, "Instruction not found")
         return item
 
-    @router.patch("/instructions/{instruction_id}")
-    def update_instruction(instruction_id: UUID, body: dict = Body(...)):
+    @router.patch("/instructions/{instruction_id}", dependencies=[Depends(admin_key)])
+    def update_instruction(instruction_id: UUID, body: InstructionPatch):
         if not record("instructions", instruction_id): raise HTTPException(404, "Instruction not found")
-        return store.record_update("instructions", instruction_id, {k: body[k] for k in ("title", "content", "priority", "tags", "expires_at") if k in body})
+        changes = body.model_dump(exclude_unset=True)
+        for field in ("title", "content", "priority", "status", "tags"):
+            if field in changes and changes[field] is None:
+                raise HTTPException(422, f"{field} cannot be null")
+        for field in ("title", "content"):
+            if field in changes:
+                changes[field] = changes[field].strip()
+                if not changes[field]: raise HTTPException(422, f"{field} cannot be blank")
+        return store.record_update("instructions", instruction_id, changes)
 
     def _instruction_action(instruction_id: UUID, action: str, body: dict):
         if not record("instructions", instruction_id): raise HTTPException(404, "Instruction not found")
@@ -565,10 +797,16 @@ def build_router(store, project_service, agent_service, memory_service):
     @router.post("/instructions/{instruction_id}/revoke", dependencies=[Depends(admin_key)])
     def revoke_instruction(instruction_id: UUID, body: dict = Body(default={})): return _instruction_action(instruction_id, "revoke", body)
 
-    @router.delete("/instructions/{instruction_id}")
+    @router.delete("/instructions/{instruction_id}", dependencies=[Depends(admin_key)])
     def delete_instruction(instruction_id: UUID):
-        if not store.record_delete("instructions", instruction_id): raise HTTPException(404, "Instruction not found")
+        with store._lock:
+            if not store.record_delete("instructions", instruction_id): raise HTTPException(404, "Instruction not found")
+            for mapping in store.record_list("task_instructions", limit=10**9):
+                ids = mapping.get("instruction_ids", [])
+                if str(instruction_id) in ids:
+                    store.record_update("task_instructions", mapping["id"], {"instruction_ids": [value for value in ids if value != str(instruction_id)]})
         return {"deleted": True, "id": str(instruction_id)}
+
 
     # Memory lifecycle, revisions, links and feedback.
     @router.post("/memories/batch", status_code=201)

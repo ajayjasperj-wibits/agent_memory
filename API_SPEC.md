@@ -70,7 +70,7 @@ Memory record: `{id,title,content,type,project_id,agent_id?,session_id?,scope:"p
 | POST | `/v1/memories/{id}/feedback` | — | `{rating:"useful"|"irrelevant"|"incorrect"|"outdated",comment?,agent_id?,session_id?}` |
 
 ## Tasks and agent coordination
-Tasks are first-class SQLite records with dedicated task, attachment, and event tables. Task descriptions may contain Quill rich-text HTML. Status is `pending`, `working`, or `done`; priority is `low`, `normal`, `high`, or `urgent`. An assigned agent can claim work and record progress. Attachments are copied into the server's configured attachment directory; the response includes both the source path hint and the absolute server path for agent access.
+Tasks are first-class SQLite records with dedicated task, attachment, and event tables. Task descriptions may contain Quill rich-text HTML. Status is `open`, `working`, `done`, `reopened`, or `closed`; priority is `low`, `normal`, `high`, or `urgent`. An assigned agent can claim work and record progress. Attachments are copied into the server's configured attachment directory; the response includes both the source path hint and the absolute server path for agent access.
 
 | Method | Path | Query / multipart fields | JSON body |
 |---|---|---|---|
@@ -81,11 +81,16 @@ Tasks are first-class SQLite records with dedicated task, attachment, and event 
 | POST | `/v1/tasks/{task_id}/claim` | — | `{agent_id,note?}`; sets status to `working` |
 | POST | `/v1/tasks/{task_id}/events` | — | `{note,agent_id?}` |
 | GET | `/v1/tasks/{task_id}/events` | `limit?,cursor?` | — |
-| POST | `/v1/tasks/{task_id}/attachments` | multipart `files[]`, optional `source_paths[]`; max 20 files, 25 MB each and 100 MB combined | — |
+| GET | `/v1/tasks/{task_id}/sessions` | `limit?,cursor?` | — |
+| POST | `/v1/tasks/{task_id}/sessions` | — | `{title?,agent_id?}`; creates an active task-linked console session |
+| POST | `/v1/tasks/{task_id}/run` | — | `{session_id?}`; starts the configured CLI agent and returns `202` |
+| POST | `/v1/tasks/{task_id}/attachments` | dev-key administrator only; multipart `files[]`, optional `source_paths[]`; max 20 files, 25 MB each and 100 MB combined; task-scoped SHA-256 duplicates are skipped and returned as `skipped_duplicates` | — |
 | GET | `/v1/tasks/{task_id}/attachments/{attachment_id}/download` | — | — |
 | DELETE | `/v1/tasks/{task_id}` | — | — |
 
-Agents can poll `GET /v1/tasks?project_id=...&status=pending`, claim a task with their registered `agent_id`, post updates, and PATCH `status:"done"` when the work is complete. A status transition is retained in the task event history. Agent updates do not allow the acting agent to claim a task assigned to another agent.
+Agents can poll `GET /v1/tasks?project_id=...&status=open`, claim a task with their registered `agent_id`, post updates, and PATCH `status:"done"` when the work is complete. A status transition is retained in the task event history. Agent updates do not allow the acting agent to claim a task assigned to another agent.
+
+The task console UI uses the task session endpoints to create a custom discussion session, append user messages, and display agent/tool events. `POST /v1/tasks/{task_id}/run` never accepts a command from the browser. It runs the server-configured `AGENT_CLI_COMMAND` in `AGENT_CLI_WORKSPACE` (defaulting to the server working directory), passing `AGENT_MEMORY_TASK_ID`, `AGENT_MEMORY_SESSION_ID`, and `AGENT_MEMORY_PROJECT_ID` to the child process. CLI output is persisted as session `tool_result` events and the task/session are finalized from the process exit code.
 
 ## Sessions, events & summaries
 | Method | Path | Query | JSON body |
@@ -192,5 +197,15 @@ curl -fsS -X POST "$BASE/tasks/$TASK_ID/attachments" -H "X-API-Key: $MEMORY_API_
 ## Explicit non-goals for MVP
 - No automatic Codex transcript capture without a documented Codex hook/adapter.
 - No embeddings or vector search unless separately installed and tested.
-- No arbitrary code execution, shell execution or URL fetching from stored memories.
+- No browser-selected arbitrary command execution; CLI execution is limited to the server-configured `AGENT_CLI_COMMAND`.
 - No multi-user cloud deployment claim: SQLite is local-first; move to Postgres for higher write concurrency and distributed deployments.
+
+### Member removal
+
+`DELETE /v1/members/{member_id}` requires the dev-key administrator. Returns `{"deleted": true, "id": "<member-id>"}`. Removes the registered member credential immediately; existing tasks and creator IDs are preserved. Unknown members return 404. Built-in identities are not registered members and cannot be removed through this endpoint.
+
+### Task instruction mapping
+
+`PUT /v1/tasks/{task_id}/instructions` requires dev-key. Body: `{"instruction_ids": ["<instruction-id>"]}` (maximum 100 entries). Replaces the mapping; an empty array clears it, repeated IDs are deduplicated, and missing instructions return 404 without changing the current mapping. Task responses include `instruction_ids` and current instruction records in `instructions`. A member can read these on their own tasks but cannot change mappings. Mappings persist across restarts and are removed with a deleted task; deleting an instruction removes it from mappings. Mapping does not change instruction approval status or scope.
+
+Instruction `PATCH`/`DELETE` require dev-key. Editing accepts title, content, priority (0–100), tags and expiry; scope and approval use their existing lifecycle. The Instructions UI offers edit/delete controls and the task UI offers a mapping selector.

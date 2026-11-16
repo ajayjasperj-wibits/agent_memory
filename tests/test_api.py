@@ -102,6 +102,36 @@ def test_tasks_priority_assignment_agent_progress_and_events(client):
     assert client.post(f"/v1/tasks/{task['id']}/events", headers=headers(), json={"note": " "}).status_code == 422
 
 
+def test_task_console_sessions_messages_and_configured_cli_runner(client, monkeypatch):
+    project, agent, _ = seed(client)
+    task = client.post("/v1/tasks", headers=headers(), json={
+        "project_id": project["id"], "title": "Run console agent", "agent_id": agent["id"],
+    }).json()
+    path = f"/v1/tasks/{task['id']}"
+    session = client.post(path + "/sessions", headers=headers(), json={}).json()
+    assert session["task_id"] == task["id"]
+    assert client.get(path + "/sessions", headers=headers()).json()["items"][0]["id"] == session["id"]
+
+    message = client.post(f"/v1/sessions/{session['id']}/events", headers=headers(), json={
+        "role": "user", "kind": "message", "content": "Start the task",
+    })
+    assert message.status_code == 201
+    assert client.get(f"/v1/sessions/{session['id']}/events", headers=headers()).json()["items"]
+
+    assert client.post(path + "/run", headers=headers(), json={"session_id": session["id"]}).status_code == 409
+    monkeypatch.setenv("AGENT_CLI_COMMAND", "python3 -c 'print(\"agent output\")'")
+    started = client.post(path + "/run", headers=headers(), json={"session_id": session["id"]})
+    assert started.status_code == 202
+    assert started.json()["session_id"] == session["id"]
+    import time
+    for _ in range(30):
+        events = client.get(f"/v1/sessions/{session['id']}/events", headers=headers()).json()["items"]
+        if any("agent output" in event["content"] for event in events):
+            break
+        time.sleep(0.01)
+    assert any("agent output" in event["content"] for event in events)
+
+
 def test_task_file_upload_persists_safe_server_path_and_source_path(client, tmp_path, monkeypatch):
     project, _, _ = seed(client)
     monkeypatch.setenv("MEMORY_ATTACHMENT_DIR", str(tmp_path / "attachments"))
@@ -302,3 +332,142 @@ def test_member_can_edit_and_delete_own_task(client):
     assert client.delete(path, headers=headers(other['api_key'])).status_code == 404
     assert client.delete(path, headers=owner).json()['deleted'] is True
     assert client.get(path, headers=owner).status_code == 404
+
+
+def test_task_attachments_require_dev_key_even_for_task_owner(client, tmp_path, monkeypatch):
+    project, _, _ = seed(client)
+    attachment_root = tmp_path / "restricted-attachments"
+    monkeypatch.setenv("MEMORY_ATTACHMENT_DIR", str(attachment_root))
+    member = client.post('/v1/members', headers=headers(), json={
+        'name': 'Upload restricted member', 'api_key': 'upload-member-key-005',
+    }).json()
+    for credential in ('test-key', member['api_key']):
+        task = client.post('/v1/tasks', headers=headers(credential), json={
+            'project_id': project['id'], 'title': 'Member task without upload access',
+        }).json()
+        response = client.post(
+            f"/v1/tasks/{task['id']}/attachments", headers=headers(credential),
+            files={'files': ('blocked.txt', b'not permitted', 'text/plain')},
+        )
+        assert response.status_code == 403
+        assert client.get(f"/v1/tasks/{task['id']}", headers=headers()).json()['attachments'] == []
+    assert not attachment_root.exists()
+    response = client.post(
+        f"/v1/tasks/{task['id']}/attachments", headers=headers(),
+        files={'files': ('allowed.txt', b'admin attachment', 'text/plain')},
+    )
+    assert response.status_code == 201
+    assert Path(response.json()['items'][0]['path']).read_bytes() == b'admin attachment'
+
+
+def test_attachment_deduplication_by_content_and_task(client, tmp_path, monkeypatch):
+    project, _, _ = seed(client)
+    root = tmp_path / 'deduplicated-files'
+    monkeypatch.setenv('MEMORY_ATTACHMENT_DIR', str(root))
+    def task():
+        return client.post('/v1/tasks', headers=headers(), json={
+            'project_id': project['id'], 'title': 'Attachment deduplication',
+        }).json()['id']
+    first, second = task(), task()
+    def upload(task_id, files):
+        response = client.post(f'/v1/tasks/{task_id}/attachments', headers=headers(),
+                               files=[('files', (name, content, 'text/plain')) for name, content in files])
+        assert response.status_code == 201
+        return response.json()
+    batch = upload(first, [('original.txt', b'same content'), ('renamed.txt', b'same content')])
+    assert len(batch['items']) == 1
+    assert batch['skipped_duplicates'] == ['renamed.txt']
+    repeat = upload(first, [('again.txt', b'same content')])
+    assert repeat['items'] == [] and repeat['skipped_duplicates'] == ['again.txt']
+    # A changed file with the same name is a legitimate new attachment.
+    assert len(upload(first, [('original.txt', b'changed content')])['items']) == 1
+    assert len(upload(second, [('original.txt', b'same content')])['items']) == 1
+    assert len(client.get(f'/v1/tasks/{first}', headers=headers()).json()['attachments']) == 2
+    events = client.get(f'/v1/tasks/{first}/events', headers=headers()).json()['items']
+    assert sum(event['action'] == 'attachment_added' for event in events) == 2
+    assert len([file for file in root.rglob('*') if file.is_file()]) == 3
+
+
+def test_admin_can_remove_member_and_revoke_key_without_deleting_tasks(client):
+    project, _, _ = seed(client)
+    member = client.post('/v1/members', headers=headers(), json={
+        'name': 'Removable member', 'api_key': 'remove-member-test-006',
+    }).json()
+    own = headers(member['api_key'])
+    task = client.post('/v1/tasks', headers=own, json={
+        'project_id': project['id'], 'title': 'Keep this task',
+    }).json()
+    path = '/v1/members/' + member['id']
+    assert client.delete(path, headers=own).status_code == 403
+    assert client.delete(path, headers=headers('test-key')).status_code == 403
+    assert client.delete(path).status_code == 401
+    assert client.delete(path, headers=headers()).status_code == 200
+    assert client.get('/v1/me', headers=own).status_code == 401
+    assert not any(m['id'] == member['id'] for m in client.get('/v1/members', headers=headers()).json()['items'])
+    preserved = client.get('/v1/tasks/'+task['id'], headers=headers())
+    assert preserved.status_code == 200
+    assert preserved.json()['creator_id'] == member['id']
+    assert client.delete(path, headers=headers()).status_code == 404
+
+
+def test_instruction_mapping_is_dev_only_persistent_and_validated(client):
+    project, _, _ = seed(client)
+    own = headers('test-key')
+    task = client.post('/v1/tasks', headers=own, json={
+        'project_id': project['id'], 'title': 'Task with mapped guidance',
+    }).json()
+    instruction = client.post('/v1/instructions', headers=headers(), json={
+        'title': 'Review checklist', 'content': 'Verify the result', 'scope': 'global',
+        'priority': 50, 'source': 'manual', 'status': 'approved',
+    }).json()
+    path = f"/v1/tasks/{task['id']}/instructions"
+    payload = {'instruction_ids': [instruction['id'], instruction['id']]}
+    assert client.put(path, headers=own, json=payload).status_code == 403
+    member = client.post('/v1/members', headers=headers(), json={
+        'name': 'Cannot map', 'api_key': 'mapping-member-key-007',
+    }).json()
+    assert client.put(path, headers=headers(member['api_key']), json=payload).status_code == 403
+    assert client.put(path, json=payload).status_code == 401
+    response = client.put(path, headers=headers(), json=payload)
+    assert response.status_code == 200
+    assert response.json()['instruction_ids'] == [instruction['id']]
+    assert response.json()['instructions'][0]['content'] == 'Verify the result'
+    assert client.get('/v1/tasks/'+task['id'], headers=own).json()['instruction_ids'] == [instruction['id']]
+    assert client.put(path, headers=headers(), json={'instruction_ids': ['00000000-0000-0000-0000-000000000000']}).status_code == 404
+    assert client.put(path, headers=headers(), json={'instruction_ids': ['invalid']}).status_code == 422
+    reopened = SQLiteStore(client.app.state.store.path)
+    assert reopened.record_get('task_instructions', task['id'])['instruction_ids'] == [instruction['id']]
+    reopened.db.close()
+    assert client.put(path, headers=headers(), json={'instruction_ids': []}).json()['instructions'] == []
+    assert client.put(path, headers=headers(), json=payload).status_code == 200
+    assert client.delete('/v1/tasks/'+task['id'], headers=headers()).status_code == 200
+    assert client.app.state.store.record_get('task_instructions', task['id']) is None
+
+
+def test_instruction_edit_delete_updates_mapped_tasks(client):
+    project, _, _ = seed(client)
+    instruction = client.post('/v1/instructions', headers=headers(), json={
+        'title': 'Original', 'content': 'Original text', 'scope': 'global',
+        'priority': 20, 'source': 'manual', 'status': 'approved',
+    }).json()
+    task = client.post('/v1/tasks', headers=headers(), json={
+        'project_id': project['id'], 'title': 'Mapped task',
+    }).json()
+    path = '/v1/instructions/'+instruction['id']
+    mapping = '/v1/tasks/'+task['id']+'/instructions'
+    assert client.put(mapping, headers=headers(), json={'instruction_ids': [instruction['id']]}).status_code == 200
+    assert client.patch(path, headers=headers('test-key'), json={'title': 'Blocked'}).status_code == 403
+    assert client.delete(path, headers=headers('test-key')).status_code == 403
+    for invalid in ({'title': '  '}, {'content': None}, {'priority': 101}, {'scope': 'project'}):
+        assert client.patch(path, headers=headers(), json=invalid).status_code == 422
+    changed = client.patch(path, headers=headers(), json={
+        'title': 'Updated', 'content': 'Updated guidance', 'priority': 75, 'tags': ['review'],
+    })
+    assert changed.status_code == 200
+    assert changed.json()['scope'] == 'global' and changed.json()['status'] == 'approved'
+    detail = client.get('/v1/tasks/'+task['id'], headers=headers()).json()
+    assert detail['instructions'][0]['content'] == 'Updated guidance'
+    assert client.delete(path, headers=headers()).status_code == 200
+    assert client.get('/v1/tasks/'+task['id'], headers=headers()).json()['instruction_ids'] == []
+    assert client.app.state.store.record_get('task_instructions', task['id'])['instruction_ids'] == []
+    assert client.get(path, headers=headers()).status_code == 404
