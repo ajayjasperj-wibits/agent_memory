@@ -389,11 +389,23 @@ def build_router(store, project_service, agent_service, memory_service):
             "task": task.title,
             "title": body.title or f"{task.title} console",
             "status": "active",
-            "metadata": {"task_id": str(task.id), "source": "task-console"},
+            "metadata": {"task_id": str(task.id), "source": "task-console", "agent_state": "online"},
         })
 
+    def cli_command():
+        return os.getenv("AGENT_CLI_COMMAND", "").strip()
+
+    def project_workspace(task):
+        configured = os.getenv("AGENT_CLI_WORKSPACE", "").strip()
+        project = store.get(task.project_id, Project)
+        metadata = project.metadata if project else {}
+        workspace = configured or next((metadata.get(key) for key in ("repository", "workspace", "root", "path") if metadata.get(key)), "")
+        if not workspace or not Path(workspace).is_dir():
+            raise HTTPException(409, "The task project has no valid repository/workspace root")
+        return str(Path(workspace).resolve())
+
     def run_configured_agent(task, session):
-        command = os.getenv("AGENT_CLI_COMMAND", "").strip()
+        command = cli_command()
         if not command:
             return False
         try:
@@ -402,9 +414,7 @@ def build_router(store, project_service, agent_service, memory_service):
             raise HTTPException(500, f"Invalid AGENT_CLI_COMMAND: {exc}") from exc
         if not argv:
             return False
-        workspace = os.getenv("AGENT_CLI_WORKSPACE", os.getcwd())
-        if not Path(workspace).is_dir():
-            raise HTTPException(500, "AGENT_CLI_WORKSPACE is not a directory")
+        workspace = project_workspace(task)
         session_id = str(session["id"])
 
         def worker():
@@ -416,17 +426,27 @@ def build_router(store, project_service, agent_service, memory_service):
             })
             process = None
             try:
-                prior_events = store.record_list("events", {"session_id": session_id}, limit=50)
+                session_record = store.record_get("sessions", session_id) or {}
+                prior_events = store.record_list("events", {"session_id": session_id}, limit=100)
                 transcript = "\n".join(
                     f"{event.get('role', 'event')}: {event.get('content', '')}"
                     for event in reversed(prior_events)
                 )
+                if len(transcript) > 24000:
+                    transcript = "[Earlier history is retained on the server; only recent context is included.]\n" + transcript[-24000:]
                 prompt = (
                     "Work on the following task in the configured workspace. "
                     "Use the task requirements and session discussion as context.\n\n"
                     f"Task title: {task.title}\nTask description:\n{task.description or '(none)'}\n\n"
+                    f"Session summary:\n{session_record.get('summary') or '(none)'}\n\n"
                     f"Session discussion:\n{transcript or '(none)'}\n"
                 )
+                started_at = datetime.now(timezone.utc).isoformat()
+                store.record_update("sessions", session_id, {
+                    "status": "active",
+                    "run_started_at": started_at,
+                    "metadata": {**(session_record.get("metadata") or {}), "agent_state": "typing", "run_started_at": started_at, "workspace": workspace},
+                })
                 store.record_create("events", {
                     "session_id": session_id,
                     "role": "system",
@@ -439,7 +459,7 @@ def build_router(store, project_service, agent_service, memory_service):
                     cwd=workspace,
                     env=env,
                     stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
+                    stderr=subprocess.PIPE,
                     stdin=subprocess.PIPE,
                     text=True,
                     bufsize=1,
@@ -447,18 +467,29 @@ def build_router(store, project_service, agent_service, memory_service):
                 if process.stdin:
                     process.stdin.write(prompt)
                     process.stdin.close()
-                for line in process.stdout or ():
-                    content = line.rstrip()
-                    if content:
-                        store.record_create("events", {
-                            "session_id": session_id,
-                            "role": "tool",
-                            "kind": "tool_result",
-                            "content": content,
-                            "tool_name": argv[0],
-                        })
+                def persist_stream(stream, role, kind):
+                    for line in stream or ():
+                        content = line.rstrip()
+                        if content:
+                            store.record_create("events", {
+                                "session_id": session_id,
+                                "role": role,
+                                "kind": kind,
+                                "content": content,
+                                "tool_name": argv[0],
+                            })
+
+                stdout_thread = threading.Thread(target=persist_stream, args=(process.stdout, "assistant", "message"), daemon=True)
+                stderr_thread = threading.Thread(target=persist_stream, args=(process.stderr, "tool", "tool_result"), daemon=True)
+                stdout_thread.start(); stderr_thread.start()
                 return_code = process.wait()
+                stdout_thread.join(timeout=5); stderr_thread.join(timeout=5)
                 final_status = "completed" if return_code == 0 else "failed"
+                output_events = store.record_list("events", {"session_id": session_id}, limit=100)
+                summary = "\n".join(
+                    event.get("content", "") for event in reversed(output_events)
+                    if event.get("role") == "assistant"
+                )[-12000:]
                 store.record_create("events", {
                     "session_id": session_id,
                     "role": "system",
@@ -469,6 +500,8 @@ def build_router(store, project_service, agent_service, memory_service):
                     "status": final_status,
                     "ended_at": datetime.now(timezone.utc).isoformat(),
                     "exit_code": return_code,
+                    "summary": summary or f"CLI agent exited with code {return_code}",
+                    "metadata": {**(store.record_get("sessions", session_id) or {}).get("metadata", {}), "agent_state": "offline"},
                 })
                 task.status = "done" if return_code == 0 else "reopened"
                 task.completed_at = datetime.now(timezone.utc) if return_code == 0 else None
@@ -486,6 +519,8 @@ def build_router(store, project_service, agent_service, memory_service):
                 store.record_update("sessions", session_id, {
                     "status": "failed",
                     "ended_at": datetime.now(timezone.utc).isoformat(),
+                    "summary": str(exc),
+                    "metadata": {**(store.record_get("sessions", session_id) or {}).get("metadata", {}), "agent_state": "offline", "error": str(exc)},
                 })
 
         threading.Thread(target=worker, name=f"agent-session-{session_id}", daemon=True).start()
@@ -499,6 +534,8 @@ def build_router(store, project_service, agent_service, memory_service):
         session = record("sessions", body.session_id) if body.session_id else None
         if session and session.get("task_id") != str(task.id):
             raise HTTPException(422, "Session is not linked to this task")
+        if session and (session.get("metadata") or {}).get("agent_state") == "typing":
+            raise HTTPException(409, "The CLI agent is already running for this session")
         if not session:
             session = create_task_session(task_id, TaskSessionIn())
         if session.get("status") != "active":
@@ -509,7 +546,7 @@ def build_router(store, project_service, agent_service, memory_service):
                 "ended_at": None,
                 "exit_code": None,
             })
-        if not os.getenv("AGENT_CLI_COMMAND", "").strip():
+        if not cli_command():
             raise HTTPException(409, "AGENT_CLI_COMMAND is not configured")
         previous_status = task.status
         task.status = "working"

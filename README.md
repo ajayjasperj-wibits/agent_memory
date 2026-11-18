@@ -11,7 +11,7 @@ export AGENT_CLI_COMMAND='codex --ask-for-approval never exec --sandbox workspac
 export AGENT_CLI_WORKSPACE='/path/to/workspace'
 ```
 
-The command is server-configured and is never accepted from the browser. Each run receives the task description and prior session discussion through stdin. The child process also receives `AGENT_MEMORY_TASK_ID`, `AGENT_MEMORY_SESSION_ID`, and `AGENT_MEMORY_PROJECT_ID`; stdout and stderr are persisted as session events. Sending another console message and running again gives Codex the updated session transcript.
+The command is server-configured and is never accepted from the browser. The bundled user service uses Codex with `--approve-for-me` (this flag selects the workspace-write approval flow); each task run resolves its workspace from the linked project's `metadata.repository` (an explicit `AGENT_CLI_WORKSPACE` override is supported). Each run receives the task description, saved session summary, and bounded recent discussion through stdin. The child process also receives `AGENT_MEMORY_TASK_ID`, `AGENT_MEMORY_SESSION_ID`, and `AGENT_MEMORY_PROJECT_ID`; stdout is persisted as assistant messages and stderr as tool events. The console polls active sessions, shows online/typing/offline state, and sending a message persists it and starts the next run automatically. Full event history remains server-side so reopening a session can resume without resending unbounded history.
 
 For a one-command setup and launch, the script creates `.venv` and installs the dependencies there:
 

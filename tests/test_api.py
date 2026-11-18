@@ -15,6 +15,7 @@ from agent_memory.main import create_app
 def client(tmp_path, monkeypatch):
     monkeypatch.setenv("MEMORY_API_KEY", "dev-key")
     monkeypatch.setenv("MEMORY_ADMIN_API_KEY", "dev-key")
+    monkeypatch.setenv("AGENT_CLI_WORKSPACE", str(tmp_path))
     return TestClient(create_app(SQLiteStore(str(tmp_path / "memory.db"))), client=("127.0.0.1", 1234))
 
 
